@@ -1,0 +1,17 @@
+{
+  "include": ["app", "scripts", "tests", "alembic", "test_api.py"],
+  "exclude": [".venv", "**/__pycache__", ".git", "alembic/versions"],
+  "extraPaths": ["."],
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "basic",
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": ["."]
+    },
+    {
+      "root": "scripts",
+      "extraPaths": [".."]
+    }
+  ]
+}

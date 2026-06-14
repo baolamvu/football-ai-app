@@ -1,0 +1,176 @@
+================================================================================
+FOOTBALL AI PLATFORM — ARCHIVED TECHNICAL ARCHITECTURE (ML + DATA)
+================================================================================
+This file preserves the detailed design response: database shape, feature
+layers, pipeline, training dataset layout, indexes, caching, and risks.
+For beginner-friendly definitions and project workflow, see:
+  docs/BEGINNER_AI_ML_PROJECT_GUIDE.md
+For executable DDL, see:
+  db/schema/001_core_schema.sql
+================================================================================
+
+DESIGN PRINCIPLES
+-----------------
+- One training row = one match. Tree models often use home/away features and
+  deltas; Poisson/Elo use team strength pairs.
+- Leakage rule: every feature must be computable from information strictly
+  before matches.kickoff_at (or a declared feature_lock_at used consistently).
+- Anti-memorization: models consume numeric context (form, fatigue, style),
+  not team names as primary signals.
+
+ENTITY RELATIONSHIPS (SUMMARY)
+------------------------------
+leagues 1--* seasons
+seasons 1--* matches
+teams *--* seasons via season_team_registration
+matches *--1 home_team, *--1 away_team
+matches 1--* team_match_stats (two rows per match)
+matches 1--* player_match_stats (optional)
+matches 1--* match_events (optional)
+seasons 1--* standings_snapshots (append-only; team x snapshot_at)
+players 1--* injuries, suspensions, player_match_stats
+matches 1--* match_context (derby, travel, flags)
+matches 1--* match_feature_sets (versioned snapshots)
+matches 1--* predictions; predictions 1--* prediction_explanations
+teams 1--* elo_rating_history
+
+TABLES IMPLEMENTED (see 001_core_schema.sql for columns and types)
+------------------------------------------------------------------
+leagues, seasons, teams, season_team_registration, referees,
+matches, team_match_stats, players, player_match_stats, match_events,
+standings_snapshots, match_context,
+injuries, suspensions, player_importance_weights,
+elo_rating_history,
+feature_definitions, match_feature_sets,
+training_dataset_manifests, training_examples,
+ml_models, predictions, prediction_explanations
+
+CONTEXTUAL FEATURE ARCHITECTURE (LOGICAL LAYERS)
+-----------------------------------------------
+Layer A — Raw: matches, team_match_stats, optional player_match_stats.
+Layer B — Rolling/EWMA state: optional team_rolling_state for O(1) updates.
+Layer C — Match context: standings_snapshots, match_context, fatigue/travel.
+Layer D — Pre-kickoff only: all rolling stats from past matches only;
+          standings: max(snapshot_at) < kickoff_at;
+          injuries active at feature_lock_at.
+Layer E — Model encoding: floats/small ordinals; avoid high-cardinality names;
+          league_id one-hot OK for small league set.
+
+FEATURE CATEGORIES (WHAT / WHY / RISK)
+--------------------------------------
+1) Team form (rolling + EWMA): points, goals, xG, shots, possession, corners,
+   cards, fouls, clean sheet rate. Why: short-run performance. Risk: low if
+   windows exclude current match.
+
+2) Momentum: improving/declining scores, streaks. Why: recency. Risk: define
+   competition scope (league vs all comps) consistently.
+
+3) Home/away splits: separate rolling for home-only and away-only. Why: real
+   behavioral difference.
+
+4) Standings & motivation: rank, gaps to top4/relegation/title, season stage,
+   matchweek, motivation_score. Why: pressure changes risk. Risk: HIGH leakage
+   if snapshot_at is after kickoff — enforce snapshot_at < kickoff_at.
+
+5) Tactical proxies: pressing, directness, width from team_match_stats rolls.
+   Why: style without club identity. Risk: provider inconsistency — use
+   league-wise z-scores and data_quality_flags.
+
+6) Discipline: fouls/cards rates, aggressive_play_score; referee rolling rates
+   with shrinkage to league mean. Why: cards markets. Risk: do not use same-
+   match post facts as pre-match features.
+
+7) Player availability: injury_impact_score = sum(weights for unavailable).
+   Why: squad impact. Risk: HIGH if injury list updates after lock — fix
+   feature_lock_at for train and infer.
+
+8) Fatigue: rest_days, matches in 7/14d, travel_km, european fatigue,
+   congestion_score. Why: tempo/rotation/cards. Risk: venue changes — use
+   scheduled venue.
+
+9) Psychology: derby_match_indicator, rivalry_score, revenge, big_match.
+   Why: interpretable context + LLM facts. Risk: overfit if too many flags —
+   ablation tests.
+
+10) Advanced: xg_diff, shot quality, big chances, finishing/defensive
+    efficiency. Why: luck vs sustainability. Risk: low if only past matches
+    feed rolling inputs.
+
+11) Elo: rating, diff, rolling change. Why: global strength prior. Risk:
+    ensure update excludes current match until after result.
+
+12) Opponent-adjusted (recommended): strength vs league avg, SOS-adjusted
+    rolling xG. Why: reduces weak-schedule inflation.
+
+FEATURE GENERATION PIPELINE
+---------------------------
+Ingest -> validate -> store raw
+ -> post-match enrichment (xG, stats)
+ -> rolling state updater (per finished match)
+ -> pre-match feature builder (scheduled: nightly, T-24h, T-60m)
+ -> write match_feature_sets (immutable, versioned)
+ -> quality checks (nulls, drift)
+ -> training export (Parquet) or training_examples
+ -> ML train (time splits) + calibration + model registry
+ -> inference: prefer precomputed feature sets for parity with training
+
+Suggested Celery queues: ingest_high/low, features_rebuild, training_export,
+llm_explain.
+
+ML-READY DATASET STRUCTURE
+--------------------------
+Grain: match_id.
+Keys for splitting: kickoff_at, league_id, season_id, matchweek.
+Labels (post-match): 1x2, goals, O/U lines, corners, cards.
+Splits: time-ordered; rolling-origin validation; optional held-out league test.
+Never random row split.
+
+INDEXES (ALSO IN SQL FILE)
+--------------------------
+matches: kickoff_at; (season_id, kickoff_at); (home_team_id, kickoff_at);
+         (away_team_id, kickoff_at); status.
+team_match_stats: (team_id, match_id); (match_id).
+standings_snapshots: (season_id, snapshot_at); (team_id, snapshot_at).
+match_feature_sets: (computed_at DESC); UNIQUE (match_id, pipeline_version).
+predictions: (match_id, created_at DESC); (model_id).
+player_match_stats: (match_id); (team_id).
+injuries/suspensions: player + time columns for as-of joins.
+elo_rating_history: (team_id, rating_at DESC).
+
+SCALABILITY NOTES
+-----------------
+Append-only stats + immutable feature snapshots enable replay.
+Redis cache keys: fixture lists, match:features:{id}:{ver}, match:pred:{id}.
+Large tables: partition matches by season or kickoff month.
+Long-term: store training rows as Parquet in object storage; Postgres keeps
+manifests and metadata.
+
+REALTIME UPDATE STRATEGY
+------------------------
+Post-match: update rolling state within minutes.
+Pre-match: rebuild features on cadence; optional multiple snapshots (T-24h
+vs T-60m) with different pipeline_version.
+Inference: read latest match_feature_sets when possible.
+
+CACHING STRATEGY
+----------------
+Redis TTL until kickoff + buffer; invalidate on pipeline_version bump.
+
+RISKY FEATURES SUMMARY
+---------------------
+Standings/motivation: leakage if mis-timed — snapshot_at < kickoff.
+Injuries: leakage without uniform feature_lock_at.
+Referee rolling: high variance — shrink toward league mean.
+Psychology flags: overfit risk — regularization + ablation.
+Team IDs in trees: memorization — drop or strong cross-league validation.
+Bookmaker odds: excluded as labels; if ever used as features, treat carefully.
+
+SUCCESS CRITERIA IN PRODUCTION
+-------------------------------
+- Replay any match from raw DB + code version -> identical feature_vector.
+- Gains from context (fatigue, motivation, SOS), not from team name alone.
+- LLM explanations cite structured_facts, not invented statistics.
+
+================================================================================
+END OF ARCHIVED ARCHITECTURE DOCUMENT
+================================================================================
