@@ -1,0 +1,34 @@
+name: Deploy to OpenShift
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install oc CLI
+        uses: redhat-actions/openshift-tools-installer@v1
+        with:
+          oc: latest
+
+      - name: Login to OpenShift
+        run: |
+          oc login ${{ secrets.OPENSHIFT_SERVER }} \
+            --token=${{ secrets.OPENSHIFT_TOKEN }} \
+            --insecure-skip-tls-verify=true
+
+      - name: Switch to project
+        run: oc project baolamvu98-dev
+
+      - name: Start build
+        run: oc start-build football-ai-app --follow --wait
+
+      - name: Wait for deploy
+        run: oc rollout status deployment/football-ai-app --timeout=5m
